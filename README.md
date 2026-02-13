@@ -2,17 +2,18 @@
 
 ## Overview
 
-This repository documents the deployment of a self-hosted Nextcloud instance running on Proxmox.
+This repository documents the deployment of a self hosted Nextcloud instance running on Proxmox.
 
-The objective of this lab was to simulate a production-style private cloud storage environment with strong security controls.
+The objective of this lab was to simulate a production style private cloud storage environment with strong security controls and realistic operational behavior.
 
 ### Key Design Goals
 
 - Separation of OS and data storage
 - LUKS encrypted data volume
-- Persistent mount configuration
+- Controlled encrypted storage lifecycle
+- Reverse proxy security model
 - Cloudflare Tunnel remote access
-- Practical, real world architecture decisions
+- Practical real world architecture decisions
 
 ---
 
@@ -44,7 +45,7 @@ lsblk
 sudo fdisk /dev/sdb
 ```
 
-Inside `fdisk`:
+Inside fdisk:
 
 ```text
 n
@@ -55,31 +56,20 @@ p
 w
 ```
 
-### Format Disk
-
-```bash
-sudo mkfs.ext4 /dev/sdb1
-```
-
 ### Apply LUKS Encryption
 
 ```bash
 sudo cryptsetup luksFormat /dev/sdb1
-```
-
-Open encrypted volume:
-
-```bash
 sudo cryptsetup open /dev/sdb1 cloudcrypt
 ```
 
-Format decrypted mapper device:
+### Format Mapper Device
 
 ```bash
 sudo mkfs.ext4 /dev/mapper/cloudcrypt
 ```
 
-Mount volume:
+### Mount Volume
 
 ```bash
 sudo mount /dev/mapper/cloudcrypt /mnt/cloud
@@ -95,7 +85,7 @@ Retrieve UUID:
 sudo blkid
 ```
 
-Update `/etc/fstab`:
+Update fstab:
 
 ```bash
 sudo nano /etc/fstab
@@ -104,18 +94,12 @@ sudo nano /etc/fstab
 Example entry:
 
 ```text
-UUID=<your-uuid> /mnt/cloud ext4 defaults 0 2
+UUID=<your-uuid> /mnt/cloud ext4 defaults,nofail 0 2
 ```
 
-Reload systemd and mount:
+**Design Note**
 
-```bash
-sudo systemctl daemon-reload
-sudo mount -a
-```
-
-> Note: If the encrypted volume is not unlocked at boot, this mount can fail.
-> (See “Encrypted Storage Operational Workflow” for recovery + automation.)
+The `nofail` option prevents emergency boot scenarios when the encrypted volume is intentionally left locked.
 
 ---
 
@@ -135,34 +119,6 @@ sudo snap services nextcloud
 
 ---
 
-## Web-Based Initial Configuration
-
-After installing Nextcloud, complete the initial setup using the web interface.
-
-Access Nextcloud:
-
-```text
-http://<VM-IP>
-```
-
-Example:
-
-```text
-http://192.168.x.x
-```
-
-During setup:
-
-- Create the admin user
-- Set a strong admin password
-- Continue using Snap-managed defaults (Apache/MySQL/Redis)
-
-You may be prompted to install recommended apps:
-- Safe to skip for labs
-- Can install later from the App Store
-
----
-
 ## Data Directory Migration
 
 Stop Nextcloud:
@@ -177,7 +133,7 @@ Create Nextcloud data marker:
 echo "# Nextcloud data directory" | sudo tee /mnt/cloud/.ncdata
 ```
 
-Sync data to the encrypted volume:
+Sync data:
 
 ```bash
 sudo rsync -Aax /var/snap/nextcloud/common/nextcloud/data/ /mnt/cloud/
@@ -190,13 +146,13 @@ sudo chown -R root:root /mnt/cloud
 sudo chmod -R 750 /mnt/cloud
 ```
 
-Update Nextcloud config:
+Update config:
 
 ```bash
-sudo nextcloud.occ config:system:set datadirectory --value="/mnt/cloud"
+sudo snap run nextcloud.occ config:system:set datadirectory --value="/mnt/cloud"
 ```
 
-Restart services:
+Restart:
 
 ```bash
 sudo snap start nextcloud
@@ -206,174 +162,158 @@ sudo snap start nextcloud
 
 ## Encrypted Storage Operational Workflow
 
-The Nextcloud data directory resides on a LUKS-encrypted volume requiring manual unlock.
+The Nextcloud data directory resides on a LUKS encrypted volume requiring manual unlock.
 
-This behavior is intentional and mirrors real-world security practices where sensitive storage is not automatically decrypted at boot.
-
-### Unlock Workflow (Post-Reboot / Maintenance)
-
-```bash
-sudo cryptsetup open /dev/sdb1 cloudcrypt
-sudo mount /dev/mapper/cloudcrypt /mnt/cloud
-sudo snap start nextcloud
-```
-
-Verify mount:
-
-```bash
-df -h | grep /mnt/cloud
-```
-
-### Lock Workflow (Shutdown / Security)
-
-```bash
-sudo snap stop nextcloud
-sudo umount /mnt/cloud
-sudo cryptsetup close cloudcrypt
-```
-
-### Failure Scenario Behavior
-
-If the encrypted disk is not unlocked at boot:
-
-- `/mnt/cloud` mount fails
-- Nextcloud may error or show missing files
-- System may enter emergency mode depending on fstab configuration
-
-Recovery:
-
-```bash
-sudo cryptsetup open /dev/sdb1 cloudcrypt
-sudo mount /dev/mapper/cloudcrypt /mnt/cloud
-sudo snap start nextcloud
-```
+This behavior is intentional and mirrors real world security practices where sensitive storage is not automatically decrypted at boot.
 
 ---
 
-## Unlock Script Automation
+## Hardened Unlock Script
 
 Create script:
 
 ```bash
-sudo nano /usr/local/sbin/unlock-cloudvault.sh
+sudo nano /usr/local/sbin/unlock.sh
 ```
 
 Script contents:
 
 ```bash
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-echo "----------------------------------------"
-echo "CloudVault Unlock Workflow"
-echo "----------------------------------------"
+LOCKFILE="/run/cloudvault.lock"
+exec 9>"$LOCKFILE"
+flock -n 9 || { echo "[ERROR] Another CloudVault operation is running."; exit 1; }
 
 DEVICE="/dev/sdb1"
 MAPPER="cloudcrypt"
 MOUNTPOINT="/mnt/cloud"
 
-if [ ! -b "$DEVICE" ]; then
-  echo "[ERROR] LUKS device not found: $DEVICE"
-  exit 1
-fi
+echo "=== CloudVault UNLOCK ==="
 
-if [ -e "/dev/mapper/$MAPPER" ]; then
-  echo "[INFO] Volume already unlocked"
+echo "[INFO] Stopping Nextcloud (bounded wait)..."
+sudo timeout 60 snap stop nextcloud || true
+
+if sudo cryptsetup status "$MAPPER" >/dev/null 2>&1; then
+  echo "[INFO] Mapping already open"
 else
-  echo "[INFO] Unlocking LUKS volume..."
-  sudo cryptsetup open "$DEVICE" "$MAPPER" || exit 1
+  echo "[INFO] Unlocking LUKS volume"
+  sudo cryptsetup open "$DEVICE" "$MAPPER"
 fi
 
 if mount | grep -q " $MOUNTPOINT "; then
-  echo "[INFO] Volume already mounted"
+  echo "[INFO] Already mounted"
 else
-  echo "[INFO] Mounting volume..."
-  sudo mount "/dev/mapper/$MAPPER" "$MOUNTPOINT" || exit 1
+  echo "[INFO] Mounting volume"
+  sudo mount "/dev/mapper/$MAPPER" "$MOUNTPOINT"
 fi
 
-if [ ! -f "$MOUNTPOINT/.ncdata" ]; then
-  echo "[WARNING] .ncdata file missing - Nextcloud may reject data directory"
-else
-  echo "[INFO] Nextcloud data marker verified"
-fi
-
-echo "[INFO] Starting Nextcloud services..."
+echo "[INFO] Starting Nextcloud"
 sudo snap start nextcloud
 
 echo "[SUCCESS] CloudVault online"
-df -h | grep "$MOUNTPOINT"
 ```
 
 Make executable:
 
 ```bash
-sudo chmod +x /usr/local/sbin/unlock-cloudvault.sh
-```
-
-Run:
-
-```bash
-sudo /usr/local/sbin/unlock-cloudvault.sh
+sudo chmod +x /usr/local/sbin/unlock.sh
 ```
 
 ---
 
-## Lock Script Automation
+## Hardened Lock Script
 
 Create script:
 
 ```bash
-sudo nano /usr/local/sbin/lock-cloudvault.sh
+sudo nano /usr/local/sbin/lock.sh
 ```
 
 Script contents:
 
 ```bash
-#!/bin/bash
+#!/usr/bin/env bash
+set -euo pipefail
 
-echo "----------------------------------------"
-echo "CloudVault Lock Workflow"
-echo "----------------------------------------"
+LOCKFILE="/run/cloudvault.lock"
+exec 9>"$LOCKFILE"
+flock -n 9 || { echo "[ERROR] Another CloudVault operation is running."; exit 1; }
 
 MAPPER="cloudcrypt"
 MOUNTPOINT="/mnt/cloud"
 
-echo "[INFO] Stopping Nextcloud services..."
-sudo snap stop nextcloud
+echo "=== CloudVault LOCK ==="
 
-if mount | grep -q " $MOUNTPOINT "; then
-  echo "[INFO] Unmounting $MOUNTPOINT..."
-  sudo umount "$MOUNTPOINT"
+sudo snap stop --disable nextcloud || true
 
-  if mount | grep -q " $MOUNTPOINT "; then
-    echo "[ERROR] Failed to unmount $MOUNTPOINT (still mounted)."
-    echo "[TIP] Check what's using it: sudo lsof +f -- $MOUNTPOINT"
-    exit 1
-  fi
-else
-  echo "[INFO] $MOUNTPOINT is not mounted (skipping unmount)."
-fi
+mount | grep -q " $MOUNTPOINT " && sudo umount "$MOUNTPOINT" || true
 
-if [ -e "/dev/mapper/$MAPPER" ]; then
-  echo "[INFO] Closing LUKS mapping $MAPPER..."
-  sudo cryptsetup close "$MAPPER" || exit 1
-else
-  echo "[INFO] LUKS mapping $MAPPER is not open (skipping close)."
-fi
+sudo cryptsetup status "$MAPPER" >/dev/null 2>&1 && sudo cryptsetup close "$MAPPER"
 
-echo "[SUCCESS] CloudVault locked (Nextcloud stopped, volume unmounted, mapping closed)."
+echo "[SUCCESS] CloudVault locked"
 ```
 
 Make executable:
 
 ```bash
-sudo chmod +x /usr/local/sbin/lock-cloudvault.sh
+sudo chmod +x /usr/local/sbin/lock.sh
 ```
 
-Run:
+---
+
+## Reverse Proxy Architecture
+
+External access is provided via Cloudflare Tunnel.
+
+No inbound ports are exposed to the WAN.
+
+**Traffic Flow**
+
+Client → Cloudflare Edge → Tunnel → Nextcloud Origin
+
+---
+
+## Reverse Proxy Security Configuration
+
+Nextcloud must explicitly trust proxy headers to prevent IP spoofing and protocol confusion.
 
 ```bash
-sudo /usr/local/sbin/lock-cloudvault.sh
+sudo snap run nextcloud.occ config:system:set trusted_proxies 0 --value="127.0.0.1"
+sudo snap run nextcloud.occ config:system:set trusted_proxies 1 --value="::1"
+
+sudo snap run nextcloud.occ config:system:set forwarded_for_headers 0 --value="HTTP_CF_CONNECTING_IP"
+
+sudo snap run nextcloud.occ config:system:set overwriteprotocol --value="https"
+sudo snap run nextcloud.occ config:system:set overwrite.cli.url --value="https://vault.techysec.com"
 ```
+
+**Security Rationale**
+
+- Prevent forged forwarding headers
+- Trust Cloudflare client IP header
+- Enforce HTTPS internally
+
+---
+
+## HTTPS Enforcement & HSTS
+
+TLS termination occurs at Cloudflare.
+
+HSTS is enforced at the edge.
+
+Example header policy:
+
+```text
+Strict-Transport-Security: max-age=15552000; includeSubDomains; preload
+```
+
+**Security Benefits**
+
+- Prevent protocol downgrade attacks
+- Enforce HTTPS only client behavior
+- Align with production best practices
 
 ---
 
@@ -386,19 +326,13 @@ sudo apt update
 sudo apt install cloudflared
 ```
 
-Install tunnel service (token-based):
+Install tunnel service:
 
 ```bash
 sudo cloudflared service install <token>
 ```
 
-Verify service:
-
-```bash
-sudo systemctl status cloudflared --no-pager -l
-```
-
-Tunnel routes should point to the local Nextcloud service:
+Example ingress policy:
 
 ```yaml
 ingress:
@@ -407,11 +341,16 @@ ingress:
   - service: http_status:404
 ```
 
-If Nextcloud reports a trusted domains error, add the hostname:
+---
 
-```bash
-sudo nextcloud.occ config:system:set trusted_domains 1 --value="vault.techysec.com"
-```
+## Database Security Characteristics
+
+Nextcloud Snap deployment:
+
+- Credentials automatically generated
+- No default credentials
+- UNIX socket communication
+- No TCP exposure
 
 ---
 
@@ -419,29 +358,30 @@ sudo nextcloud.occ config:system:set trusted_domains 1 --value="vault.techysec.c
 
 - Data disk separated from OS disk
 - Full LUKS volume encryption
-- Manual unlock requirement (no auto-unlock)
-- Remote access via Cloudflare Tunnel (no inbound port forwarding)
+- Manual unlock requirement
+- Reverse proxy header hardening
+- Remote access via Cloudflare Tunnel
 - Minimal external attack surface
 
 ---
 
 ## Lessons Learned
 
-- Snap-based Nextcloud behaves differently than package deployments
-- .ncdata file is mandatory for data directory recognition
-- Encryption + mounts can trigger emergency boot scenarios
-- systemd requires daemon reload after fstab modification
-- Cloudflare Tunnel simplifies secure remote exposure
+- Snap deployments differ from package installs
+- ncdata file is mandatory
+- Encryption and mounts impact boot behavior
+- Reverse proxy header trust is critical
+- Cloudflare Tunnel simplifies secure exposure
 
 ---
 
 ## Future Enhancements
 
 - Backup and snapshot strategy
-- Multi-user onboarding workflow
-- Network segmentation via VLANs
-- SIEM and log monitoring integration
-- Optional: tighter automation + health checks
+- Health monitoring and alerting
+- SIEM and log pipeline integration
+- Secret management workflow
+- Optional automated unlock with TPM
 
 ---
 
